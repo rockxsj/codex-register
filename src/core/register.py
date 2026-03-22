@@ -392,16 +392,119 @@ class RegistrationEngine:
 
         return None
 
+    def _normalize_page_payload(self, payload: Any) -> Any:
+        """规范化页面 payload，尽量解析成 dict/list。"""
+        if isinstance(payload, (dict, list)):
+            return payload
+        if isinstance(payload, str):
+            raw = payload.strip()
+            if not raw:
+                return raw
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+        return payload
+
+    def _deep_find_first(self, data: Any, candidate_keys: Tuple[str, ...]) -> Optional[str]:
+        """在嵌套结构里按 key 名查找第一个非空字符串。"""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key in candidate_keys:
+                    text = str(value or "").strip()
+                    if text:
+                        return text
+                nested = self._deep_find_first(value, candidate_keys)
+                if nested:
+                    return nested
+        elif isinstance(data, list):
+            for item in data:
+                nested = self._deep_find_first(item, candidate_keys)
+                if nested:
+                    return nested
+        return None
+
+    def _extract_redirect_targets(self, response: Any, base_url: str) -> Dict[str, str]:
+        """从响应和重定向历史中提取 callback/resume URL。"""
+        callback_url = ""
+        resume_url = ""
+
+        def consider_url(url: str):
+            nonlocal callback_url, resume_url
+            candidate = str(url or "").strip()
+            if not candidate:
+                return
+            if "code=" in candidate and "state=" in candidate and not callback_url:
+                callback_url = candidate
+            if "/authorize/resume" in candidate and not resume_url:
+                resume_url = candidate
+
+        history = list(getattr(response, "history", None) or [])
+        chain = history + [response]
+        for item in chain:
+            consider_url(str(getattr(item, "url", "") or ""))
+            location = str((getattr(item, "headers", {}) or {}).get("Location") or "").strip()
+            if location:
+                consider_url(urllib.parse.urljoin(base_url, location))
+
+        return {
+            "callback_url": callback_url,
+            "resume_url": resume_url,
+        }
+
+    def _follow_auth_redirect_target(self, url: str) -> SignupFormResult:
+        """跟随 Auth0/授权恢复跳转，提取 callback 或页面状态。"""
+        try:
+            response = self.session.get(
+                url,
+                allow_redirects=True,
+                timeout=20,
+            )
+            redirects = self._extract_redirect_targets(response, url)
+            final_url = str(getattr(response, "url", "") or "").strip()
+            if final_url:
+                self._log(f"跟随授权跳转后的最终 URL: {final_url[:200]}")
+
+            page_type = ""
+            response_data = {
+                "callback_url": redirects.get("callback_url", ""),
+                "resume_url": redirects.get("resume_url", ""),
+            }
+            try:
+                parsed = response.json()
+                response_data["raw_json"] = parsed
+                page_type = str((parsed.get("page") or {}).get("type") or "").strip()
+            except Exception:
+                pass
+
+            return SignupFormResult(
+                success=True,
+                page_type=page_type,
+                response_data=response_data,
+                final_url=final_url,
+            )
+        except Exception as e:
+            return SignupFormResult(success=False, error_message=str(e))
+
     def _submit_login_password(self, response_data: Optional[Dict[str, Any]] = None) -> SignupFormResult:
         """提交登录密码，处理 login_password 页面。"""
         if not self.password:
             return SignupFormResult(success=False, error_message="登录流程缺少密码")
 
         page = (response_data or {}).get("page") or {}
+        page_payload = self._normalize_page_payload(page.get("payload"))
         if page:
             self._log(f"login_password 页面字段: {','.join(sorted(page.keys()))}")
+        if isinstance(page_payload, dict):
+            self._log(f"login_password payload 字段: {','.join(sorted(page_payload.keys()))}")
+        elif isinstance(page_payload, str) and page_payload:
+            self._log(f"login_password payload 文本: {page_payload[:200]}")
 
-        auth_state = str(page.get("state") or (self.oauth_start.state if self.oauth_start else "")).strip()
+        auth_state = str(
+            page.get("state")
+            or self._deep_find_first(page_payload, ("state",))
+            or (self.oauth_start.state if self.oauth_start else "")
+        ).strip()
         if not auth_state:
             return SignupFormResult(success=False, error_message="无法解析登录 state")
 
@@ -411,6 +514,9 @@ class RegistrationEngine:
             value = str(page.get(key) or "").strip()
             if value and "password" in value:
                 endpoint_candidates.append(urllib.parse.urljoin("https://auth.openai.com", value))
+        payload_action = self._deep_find_first(page_payload, ("action", "submit_url", "submit_path", "path", "url"))
+        if payload_action and "password" in payload_action:
+            endpoint_candidates.append(urllib.parse.urljoin("https://auth.openai.com", payload_action))
 
         endpoint_candidates.append(f'{OPENAI_API_ENDPOINTS["login_password"]}?state={urllib.parse.quote(auth_state, safe="")}')
 
@@ -446,7 +552,7 @@ class RegistrationEngine:
                     endpoint,
                     headers=headers,
                     data=payload,
-                    allow_redirects=True,
+                    allow_redirects=False,
                 )
             except Exception as e:
                 last_error = str(e)
@@ -459,6 +565,27 @@ class RegistrationEngine:
                 last_error = f"HTTP 404: {endpoint}"
                 continue
 
+            if response.status_code in [301, 302, 303, 307, 308]:
+                location = str(response.headers.get("Location") or "").strip()
+                if not location:
+                    last_error = f"HTTP {response.status_code}: 缺少 Location"
+                    return SignupFormResult(success=False, error_message=last_error)
+
+                next_url = urllib.parse.urljoin(endpoint, location)
+                self._log(f"登录密码后重定向到: {next_url[:200]}")
+
+                if "code=" in next_url and "state=" in next_url:
+                    return SignupFormResult(
+                        success=True,
+                        response_data={"callback_url": next_url},
+                        final_url=next_url,
+                    )
+
+                followed = self._follow_auth_redirect_target(next_url)
+                if not followed.success:
+                    return followed
+                return followed
+
             if response.status_code != 200:
                 last_error = f"HTTP {response.status_code}: {response.text[:200]}"
                 self._log(f"提交登录密码失败: {response.text[:200]}", "warning")
@@ -466,6 +593,7 @@ class RegistrationEngine:
 
             next_response_data = None
             page_type = ""
+            redirect_targets = self._extract_redirect_targets(response, endpoint)
             try:
                 next_response_data = response.json()
                 page_type = str((next_response_data.get("page") or {}).get("type") or "").strip()
@@ -480,7 +608,11 @@ class RegistrationEngine:
                 success=True,
                 page_type=page_type,
                 is_existing_account=page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
-                response_data=next_response_data,
+                response_data={
+                    "raw_json": next_response_data,
+                    "callback_url": redirect_targets.get("callback_url", ""),
+                    "resume_url": redirect_targets.get("resume_url", ""),
+                },
                 final_url=str(getattr(response, "url", "") or ""),
             )
 
@@ -1043,24 +1175,30 @@ class RegistrationEngine:
                     redirect_step = otp_step_base + 5
                     callback_step = otp_step_base + 6
                 else:
-                    final_url = str(login_result.final_url or "").strip()
-                    if "code=" in final_url and "state=" in final_url:
-                        direct_callback_url = final_url
+                    callback_from_login = str((login_result.response_data or {}).get("callback_url") or "").strip()
+                    if callback_from_login:
+                        self._log(f"登录流程已直接拿到回调 URL: {callback_from_login[:120]}...")
+                        direct_callback_url = callback_from_login
                         callback_step = otp_step_base
                     else:
-                        self._log(
-                            f"登录流程未进入 OTP 页面（{login_result.page_type or 'unknown'}），尝试恢复 OAuth 授权上下文",
-                            "warning"
-                        )
-                        direct_callback_url = self._resume_oauth_authorization() or ""
-                        if direct_callback_url:
-                            callback_step = otp_step_base + 1
+                        final_url = str(login_result.final_url or "").strip()
+                        if "code=" in final_url and "state=" in final_url:
+                            direct_callback_url = final_url
+                            callback_step = otp_step_base
                         else:
-                            self._log("OAuth 恢复后仍未直接拿到回调，继续尝试读取 Workspace", "warning")
-                            workspace_step = otp_step_base + 1
-                            select_step = otp_step_base + 2
-                            redirect_step = otp_step_base + 3
-                            callback_step = otp_step_base + 4
+                            self._log(
+                                f"登录流程未进入 OTP 页面（{login_result.page_type or 'unknown'}），尝试恢复 OAuth 授权上下文",
+                                "warning"
+                            )
+                            direct_callback_url = self._resume_oauth_authorization() or ""
+                            if direct_callback_url:
+                                callback_step = otp_step_base + 1
+                            else:
+                                self._log("OAuth 恢复后仍未直接拿到回调，继续尝试读取 Workspace", "warning")
+                                workspace_step = otp_step_base + 1
+                                select_step = otp_step_base + 2
+                                redirect_step = otp_step_base + 3
+                                callback_step = otp_step_base + 4
 
             callback_url = direct_callback_url
             if not callback_url:
