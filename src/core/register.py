@@ -718,22 +718,53 @@ class RegistrationEngine:
         """选择 Workspace"""
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
+            endpoint = OPENAI_API_ENDPOINTS["select_workspace"]
 
             response = self.session.post(
-                OPENAI_API_ENDPOINTS["select_workspace"],
+                endpoint,
                 headers={
                     "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
                     "content-type": "application/json",
                 },
                 data=select_body,
+                allow_redirects=False,
             )
+
+            self._log(f"选择 workspace 状态: {response.status_code}")
+
+            location = str(response.headers.get("Location") or "").strip()
+            if response.status_code in [301, 302, 303, 307, 308]:
+                if not location:
+                    self._log("选择 workspace 返回重定向但缺少 Location", "error")
+                    return None
+                continue_url = urllib.parse.urljoin(endpoint, location)
+                self._log(f"Workspace 重定向到: {continue_url[:100]}...")
+                return continue_url
 
             if response.status_code != 200:
                 self._log(f"选择 workspace 失败: {response.status_code}", "error")
                 self._log(f"响应: {response.text[:200]}", "warning")
                 return None
 
-            continue_url = str((response.json() or {}).get("continue_url") or "").strip()
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            continue_url = ""
+
+            try:
+                continue_url = str((response.json() or {}).get("continue_url") or "").strip()
+            except Exception as parse_error:
+                self._log(
+                    f"解析 workspace/select JSON 失败: {parse_error}; content-type={content_type or 'unknown'}; "
+                    f"url={str(getattr(response, 'url', '') or '')[:160]}; body={response.text[:200]}",
+                    "warning"
+                )
+
+                if location:
+                    continue_url = urllib.parse.urljoin(endpoint, location)
+                else:
+                    response_url = str(getattr(response, "url", "") or "").strip()
+                    if "code=" in response_url and "state=" in response_url:
+                        continue_url = response_url
+
             if not continue_url:
                 self._log("workspace/select 响应里缺少 continue_url", "error")
                 return None
@@ -748,6 +779,10 @@ class RegistrationEngine:
     def _follow_redirects(self, start_url: str) -> Optional[str]:
         """跟随重定向链，寻找回调 URL"""
         try:
+            if "code=" in start_url and "state=" in start_url:
+                self._log(f"开始 URL 已是回调 URL: {start_url[:100]}...")
+                return start_url
+
             current_url = start_url
             max_redirects = 6
 
